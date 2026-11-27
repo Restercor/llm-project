@@ -1,15 +1,18 @@
 """Два режима поиска по графу. Требования FR-4, FR-5 и FR-10."""
 
-from assistant.infra.llm import LLMClient
-from assistant.infra.schemas import Answer, KnowledgeBase, MAP_SCHEMA
-from assistant.infra.grounding import find_codes, find_names, normalize_code, canonical_name
+import json
 
 import networkx as nx
-import json
+
+from assistant.infra.grounding import canonical_name, find_codes, find_names, normalize_code
+from assistant.infra.llm import LLMClient
+from assistant.infra.schemas import MAP_SCHEMA, Answer, KnowledgeBase
 
 LOCAL_PROMPT = """Ты отвечаешь на вопрос диспетчера сервисной службы строго по фактам из графа знаний.
 Если в фактах есть цепочка замен (REPLACED_BY), называй последнюю деталь цепочки.
-Не выдумывай коды, цены и остатки. Если фактов недостаточно, скажи, что в базе знаний не найдено.
+Не выдумывай коды, цены и остатки. Если фактов недостаточно, скажи, что в базе знаний не найдено. 
+Если в фактах есть цепочка REPLACED_BY, называй ТОЛЬКО последнюю деталь цепочки.
+SP-104 — это регламент, а не деталь; детали имеют вид P-1042.
 
 Вопрос: {question}
 
@@ -69,21 +72,35 @@ def collect_facts(graph: nx.DiGraph, anchors: list[str]) -> tuple[list[str], set
     used_parts: set[str] = set()
     used_nodes: set[str] = set(anchors)
 
+    def edge_type(data) -> str:
+        if isinstance(data, dict) and data and all(isinstance(k, int) for k in data):
+            first = next(iter(data.values()))
+            
+            if isinstance(first, dict):
+                return first.get("type", "?")
+            
+        if isinstance(data, dict):
+            return data.get("type", "?")
+        return "?"
+
     def add_edge(u: str, v: str) -> None:
-        data = graph.get_edge_data(u, v)
-        
-        if data is None:
+        if not graph.has_edge(u, v):
             return
-        key = (u, data.get("type", ""), v)
+        
+        etype = edge_type(graph.get_edge_data(u, v))
+        key = (u, etype, v)
         
         if key in seen:
             return
         
         seen.add(key)
-        facts.append(format_edge(graph, u, v, data))
+        su = graph.nodes[u].get("name", u)
+        sv = graph.nodes[v].get("name", v)
+        
+        facts.append(f"{su} -{etype}-> {sv}")
         used_nodes.add(u)
         used_nodes.add(v)
-
+        
         if u.startswith("Part:"):
             used_parts.add(u)
         if v.startswith("Part:"):
@@ -95,39 +112,67 @@ def collect_facts(graph: nx.DiGraph, anchors: list[str]) -> tuple[list[str], set
             for b in anchors[i + 1:]:
                 try:
                     paths = list(nx.all_simple_paths(undirected, a, b, cutoff=3))
-                except nx.NetworkXNoPath:
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
                     paths = []
-                    
                 for path in paths:
-                    for u, v in zip(path, path[1:]):
-                        if graph.has_edge(u, v):
-                            add_edge(u, v)
-                        if graph.has_edge(v, u):
-                            add_edge(v, u)
-                            
+                    for u, v in zip(path, path[1:], strict=False):
+                        add_edge(u, v)
+                        add_edge(v, u)
+
+        for node in list(used_nodes):
+            for nbr in list(graph.neighbors(node)):
+                if not graph.has_edge(node, nbr):
+                    continue
+                
+                et = edge_type(graph.get_edge_data(node, nbr))
+                if et in ("IS_A", "HAS_PART") and nbr.startswith("Part:"):
+                    if nbr in used_parts or node in anchors:
+                        add_edge(node, nbr)
+                        add_edge(nbr, node)
     elif len(anchors) == 1:
         anchor = anchors[0]
-        
         for u, v in nx.bfs_edges(graph, anchor, depth_limit=2):
             add_edge(u, v)
+            add_edge(v, u)
         for u, v in nx.bfs_edges(graph.reverse(), anchor, depth_limit=2):
             if graph.has_edge(v, u):
                 add_edge(v, u)
 
     used_parts.update(a for a in anchors if a.startswith("Part:"))
     queue = list(used_parts)
-    
+
     while queue:
         part = queue.pop()
-        
+
         for _, v, data in graph.out_edges(part, data=True):
             if data.get("type") == "REPLACED_BY" and (part, "REPLACED_BY", v) not in seen:
                 add_edge(part, v)
-                
+
                 if v.startswith("Part:"):
                     queue.append(v)
 
+    for part in list(used_parts):
+        for u, v, data in graph.edges(part, data=True):
+            if data.get("type") == "IS_A":
+                add_edge(u, v)
+                
+        for u, v, data in graph.in_edges(part, data=True):
+            if data.get("type") == "IS_A":
+                add_edge(u, v)
+
+    for part in list(used_parts):
+        for _, v, data in graph.out_edges(part, data=True):
+            if data.get("type") == "SUPPLIED_BY":
+                add_edge(part, v)
+
+    for anchor in anchors:
+        if anchor.startswith("ErrorCode:"):
+            for _, v, data in graph.out_edges(anchor, data=True):
+                if data.get("type") == "FIXED_BY":
+                    add_edge(anchor, v)
+
     return facts, used_nodes
+
 
 def parse_map(raw: str) -> dict | None:
     try:
@@ -189,9 +234,13 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     response = llm.chat([{"role" : "user", "content" : prompt}])
     
     sources: set[str] = set()
-    for node_id in used_nodes:
-        for chunk_id in graph.nodes[node_id].get("sources", []):
-            sources.add(chunk_id.split("#")[0])
+    for u, v, data in graph.edges(data=True):
+        su = graph.nodes[u].get("name", u)
+        sv = graph.nodes[v].get("name", v)
+        edge_str = f"{su} -{data.get('type')}-> {sv}"
+        if edge_str in facts:
+            for chunk_id in data.get("sources", []):
+                sources.add(chunk_id.split("#")[0])
                                 
     return Answer(text=response.content.strip(), sources=sorted(sources), facts=facts)
 
@@ -205,7 +254,7 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     """
     # TODO: частичные ответы по сводкам, объединение
     partials: list[str] = []
-    
+    used_communities = []
     for community in kb.communities:
         if not community.summary:
             continue
@@ -218,12 +267,21 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
             continue
         if data["score"] > 0:
             partials.append(data["answer"])
+            used_communities.append(community)
             
     if not partials:
         return Answer(text="в базе знаний не найдено", refused=True)
     
+    
+    
     prompt = REDUCE_PROMPT.format(question=question, partials="\n".join(f"- {p}" for p in partials))
     response = llm.chat([{"role" : "user", "content" : prompt}])
     
-    return Answer(text=response.content.strip())
+    sources: set[str] = set()
+    for community in used_communities:
+        for node_id in community.nodes:
+            for chunk_id in kb.graph.nodes[node_id].get("sources", []):
+                sources.add(chunk_id.split("#")[0])
+                
+    return Answer(text=response.content.strip(), sources=sorted(sources))
     

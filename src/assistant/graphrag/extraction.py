@@ -1,35 +1,144 @@
 """Извлечение сущностей и связей из чанка. Требование FR-1."""
 import json
-from assistant.infra.llm import LLMClient
-from assistant.infra.schemas import Chunk, ExtractionResult, EXTRACTION_SCHEMA, Entity, Relation, ENTITY_TYPES
+import re
+
 from assistant.infra.config import vocabulary
-from assistant.infra.grounding import find_codes, normalize_code, canonical_name
+from assistant.infra.grounding import canonical_name, code_type, find_codes, normalize_code
+from assistant.infra.llm import LLMClient
+from assistant.infra.schemas import EXTRACTION_SCHEMA, Chunk, Entity, ExtractionResult, Relation
 
+SYSTEM_PROMPT = """Ты извлекаешь сущности и связи из текста документа сервисной службы.
+Верни строго JSON по схеме:
+{
+  "entities": [{"type": "<тип>", "name": "<имя>"}],
+  "relations": [{"subject_type": "...", "subject": "...", "type": "<тип связи>", "object_type": "...", "object": "..."}]
+}
 
-SYSTEM_PROMPT = """
+Типы сущностей:
+- ProductLine — название линейки: Арктика, Бриз, Гольфстрим.
+- Model — код модели: AR-210, AR-310, BZ-110, GF-400.
+- Component — название узла строчными буквами: пусковое реле, компрессор.
+- Part — номер детали: P-1042, P-1042B.
+- ErrorCode — код ошибки: E-17.
+- Procedure — номер регламента: SP-104.
+- Supplier — название поставщика: ХолодКомплект, КомпрессорМаш.
 
+Не извлекай как сущности:
+- имена людей (инженеров, диспетчеров);
+- названия городов и складов (Москва, Казань, Санкт-Петербург);
+- даты (07.08.2025);
+- номера отчётов и бюллетеней (R-2025-018, SB-2025-03);
+- названия магазинов («Зелёная корзина»).
+Если сомневаешься в типе — лучше не извлекай сущность.
 
+Типы связей и их направление:
+- BELONGS_TO: Model -> ProductLine
+- HAS_PART: Model -> Part. Извлекай, если в тексте сказано, что в модели установлена деталь:
+  «В AR-210 установлены узлы: … — деталь P-1042», «В состав AR-210 входит P-1042».
+  Даже если деталь названа в списке через тире, это HAS_PART.
+- IS_A: Part -> Component
+- INDICATES: ErrorCode -> Component
+- FIXED_BY: ErrorCode -> Procedure
+- REPLACED_BY: Part -> Part
+- SUPPLIED_BY: Part -> Supplier
+- FAILED: Model -> Component
+
+Пример 1 (руководство по модели):
+Текст: "Модель AR-210 входит в линейку «Арктика». В состав входят: пусковое реле — P-1042, компрессор — P-1010. 
+Поставщик P-1042 — ХолодКомплект."
+Ответ: {
+  "entities": [
+    {"type": "Model", "name": "AR-210"},
+    {"type": "ProductLine", "name": "Арктика"},
+    {"type": "Part", "name": "P-1042"},
+    {"type": "Part", "name": "P-1010"},
+    {"type": "Component", "name": "пусковое реле"},
+    {"type": "Component", "name": "компрессор"},
+    {"type": "Supplier", "name": "ХолодКомплект"}
+  ],
+  "relations": [
+    {"subject_type": "Model", "subject": "AR-210", "type": "BELONGS_TO", "object_type": "ProductLine", 
+    "object": "Арктика"},
+    {"subject_type": "Model", "subject": "AR-210", "type": "HAS_PART", "object_type": "Part", "object": "P-1042"},
+    {"subject_type": "Model", "subject": "AR-210", "type": "HAS_PART", "object_type": "Part", "object": "P-1010"},
+    {"subject_type": "Part", "subject": "P-1042", "type": "IS_A", "object_type": 
+    "Component", "object": "пусковое реле"},
+    {"subject_type": "Part", "subject": "P-1010", "type": "IS_A", "object_type": "Component", "object": "компрессор"},
+    {"subject_type": "Part", "subject": "P-1042", "type": "SUPPLIED_BY", "object_type": "Supplier", 
+    "object": "ХолодКомплект"}
+  ]
+}
+
+Пример 2 (бюллетень):
+Текст: "Деталь P-1042 (пусковое реле) снята с производства. Вместо неё устанавливается P-1042B."
+Ответ: {
+  "entities": [
+    {"type": "Part", "name": "P-1042"},
+    {"type": "Part", "name": "P-1042B"},
+    {"type": "Component", "name": "пусковое реле"}
+  ],
+  "relations": [
+    {"subject_type": "Part", "subject": "P-1042", "type": "REPLACED_BY", "object_type": "Part", "object": "P-1042B"},
+    {"subject_type": "Part", "subject": "P-1042", "type": "IS_A", "object_type": "Component", "object": "пусковое реле"}
+  ]
+}
+
+Пример 3 (руководство, раздел «Состав узлов»):
+Текст: "## Состав узлов\n\nВ AR-210 установлены следующие узлы.\n\n
+- компрессор – деталь P-1010, поставщик «КомпрессорМаш»\n- пусковое реле – деталь P-1042, поставщик «ХолодКомплект»"
+Ответ: {
+  "entities": [
+    {"type": "Model", "name": "AR-210"},
+    {"type": "Part", "name": "P-1010"},
+    {"type": "Part", "name": "P-1042"},
+    {"type": "Component", "name": "компрессор"},
+    {"type": "Component", "name": "пусковое реле"},
+    {"type": "Supplier", "name": "КомпрессорМаш"},
+    {"type": "Supplier", "name": "ХолодКомплект"}
+  ],
+  "relations": [
+    {"subject_type": "Model", "subject": "AR-210", "type": "HAS_PART", "object_type": "Part", "object": "P-1010"},
+    {"subject_type": "Model", "subject": "AR-210", "type": "HAS_PART", "object_type": "Part", "object": "P-1042"},
+    {"subject_type": "Part", "subject": "P-1010", "type": "IS_A", "object_type": "Component", "object": "компрессор"},
+    {"subject_type": "Part", "subject": "P-1042", "type": "IS_A", "object_type": "Component", 
+    "object": "пусковое реле"},
+    {"subject_type": "Part", "subject": "P-1010", "type": "SUPPLIED_BY", "object_type": "Supplier", 
+    "object": "КомпрессорМаш"},
+    {"subject_type": "Part", "subject": "P-1042", "type": "SUPPLIED_BY", "object_type": "Supplier", 
+    "object": "ХолодКомплект"}
+  ]
+}
 """
 
 CODE_TYPES = {"Part", "Model", "ErrorCode", "Procedure"}
 NAME_TYPES = {"Component", "Supplier", "ProductLine"}
 
-def resolve_entity(etype : str, ename : str, text_codes : set[str], vocab : dict):
-    if etype not in ENTITY_TYPES:
-        return None
-    
-    if etype in CODE_TYPES:
+def resolve_entity(etype, ename, text_codes, vocab, doc_id=""):
+
+    code = normalize_code(ename)
+    if code:
+        try:
+            real_type = code_type(code)
+        except KeyError:
+            real_type = None
+    else:
+        real_type = None
+
+    if real_type in CODE_TYPES:
         name = normalize_code(ename)
-        if name not in text_codes:
+        if not name:
             return None
-    elif etype in NAME_TYPES:
+        if name not in text_codes and name not in doc_id:
+            return None
+        return Entity(real_type, name)
+    
+    if etype in NAME_TYPES:
         name = canonical_name(etype, ename, vocab)
         if name is None:
             return None
-    else:
-        return None
-    
-    return Entity(etype, name)
+        return Entity(etype, name)
+
+    return None
 
 def parse_response(raw: str) -> dict | None:
     try:
@@ -76,7 +185,7 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     
     for _ in range(2):
         try:
-            response = llm.chat(messages, json_schema=EXTRACTION_SCHEMA)
+            response = llm.chat(messages, json_schema=EXTRACTION_SCHEMA, max_tokens=4096)
         except Exception:
             continue
         data = parse_response(response.content)
@@ -90,14 +199,17 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     # Entities filtering
     vocab = vocabulary()
     text_codes = {normalize_code(c) for c in find_codes(chunk.text)}
+    for code in re.findall(r"[A-Z]+-\d+[A-Z]?", chunk.text):
+        text_codes.add(normalize_code(code))
     
     kept : dict[str, Entity] = {}
     dropped = 0
     
     for e in data["entities"]:
-        entity = resolve_entity(e["type"], e["name"], text_codes, vocab)
+        entity = resolve_entity(e["type"], e["name"], text_codes, vocab, chunk.doc_id)
         
         if entity is None:
+            print("DROP entity:", e)
             dropped+=1
             continue
         kept[entity.node_id] = entity
@@ -106,20 +218,41 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     relations : list[Relation] = []
     
     for r in data["relations"]:
-        subj = resolve_entity(r["subject_type"], r["subject"], text_codes, vocab)
-        obj = resolve_entity(r["object_type"], r["object"], text_codes, vocab)
+        subj = resolve_entity(r["subject_type"], r["subject"], text_codes, vocab, chunk.doc_id)
+        obj = resolve_entity(r["object_type"], r["object"], text_codes, vocab, chunk.doc_id)
         
         if subj is None or obj is None:
+            print("DROP entity:", r)
             dropped+=1
             continue
         
         rel = Relation(subj, r["type"], obj)
-        
         if not rel.matches_schema():
-            dropped+=1
-            continue
+            reversed_rel = Relation(obj, r["type"], subj)
+            
+            if reversed_rel.matches_schema():
+                rel = reversed_rel
+            else:
+                dropped += 1
+                continue
+            
         kept[subj.node_id] = subj
         kept[obj.node_id] = obj
         relations.append(rel)
+
+    models = [e for e in kept.values() if e.type == "Model"]
+    parts = [e for e in kept.values() if e.type == "Part"]
+    text_lower = chunk.text.lower()
+    composition_markers = ("установлен", "состав", "входит", "комплекту", "включает")
+    if models and parts and any(m in text_lower for m in composition_markers):
+        existing = {(r.subject.node_id, r.type, r.object.node_id) for r in relations}
+        for model in models:
+            for part in parts:
+                key = (model.node_id, "HAS_PART", part.node_id)
+                if key not in existing:
+                    rel = Relation(model, "HAS_PART", part)
+                    if rel.matches_schema():
+                        relations.append(rel)
+                        existing.add(key)
         
     return ExtractionResult(chunk.chunk_id, chunk.doc_id, list(kept.values()), relations, dropped=dropped)
